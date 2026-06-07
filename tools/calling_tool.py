@@ -41,6 +41,33 @@ CALLING_SCHEMA = {
                 "type": "string",
                 "description": "The brief reason, context, or purpose for the call. Highly recommended to include.",
             },
+            "agent_mode": {
+                "type": "string",
+                "enum": ["asmi", "personal"],
+                "description": (
+                    "The agent mode preset to run. 'asmi' targets the startup testing agent "
+                    "(uses ELEVENLABS_ASMI_AGENT_ID), 'personal' targets your personal agent "
+                    "(uses ELEVENLABS_PERSONAL_AGENT_ID). Falls back to ELEVENLABS_AGENT_ID if not found."
+                ),
+            },
+            "agent_id": {
+                "type": "string",
+                "description": "Optional raw ElevenLabs agent ID to use directly, overriding agent_mode and defaults.",
+            },
+            "custom_prompt": {
+                "type": "string",
+                "description": (
+                    "Optional system prompt instruction override to dynamically direct the agent's behavior. "
+                    "Requires 'System prompt override' to be enabled in the ElevenLabs agent Security settings."
+                ),
+            },
+            "first_message": {
+                "type": "string",
+                "description": (
+                    "Optional custom first message for the agent to speak. "
+                    "Requires 'First message override' to be enabled in the ElevenLabs agent Security settings."
+                ),
+            },
         },
         "required": [],
     },
@@ -231,14 +258,26 @@ def make_phone_call(args: dict, **kwargs) -> str:
     # 2. Check and load environment variables
     load_hermes_dotenv()
     api_key = os.environ.get("ELEVENLABS_API_KEY")
-    agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
     phone_number_id = os.environ.get("ELEVENLABS_PHONE_NUMBER_ID")
     personal_number = os.environ.get("USER_PERSONAL_PHONE_NUMBER")
+
+    # Resolve agent ID based on mode or argument
+    agent_mode = args.get("agent_mode", "").strip().lower()
+    arg_agent_id = args.get("agent_id", "").strip()
+
+    if arg_agent_id:
+        agent_id = arg_agent_id
+    elif agent_mode == "asmi":
+        agent_id = os.environ.get("ELEVENLABS_ASMI_AGENT_ID") or os.environ.get("ELEVENLABS_AGENT_ID")
+    elif agent_mode == "personal":
+        agent_id = os.environ.get("ELEVENLABS_PERSONAL_AGENT_ID") or os.environ.get("ELEVENLABS_AGENT_ID")
+    else:
+        agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
 
     if not all([api_key, agent_id, phone_number_id]):
         return tool_error(
             "Outbound call configuration is incomplete. "
-            "Please check ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, and ELEVENLABS_PHONE_NUMBER_ID."
+            "Please check ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID (or mode-specific ID), and ELEVENLABS_PHONE_NUMBER_ID."
         )
 
     # 3. Determine target number
@@ -275,15 +314,34 @@ def make_phone_call(args: dict, **kwargs) -> str:
         "to_number": target_number
     }
 
-    # Pass optional context if reason is provided
+    # Pass optional context if reason, custom_prompt, or first_message is provided
+    client_data = {
+        "type": "conversation_initiation_client_data"
+    }
     if reason:
-        payload["conversation_initiation_client_data"] = {
-            "type": "conversation_initiation_client_data",
-            "dynamic_variables": {
-                "reason": reason,
-                "context": reason
-            }
+        client_data["dynamic_variables"] = {
+            "reason": reason,
+            "context": reason
         }
+
+    custom_prompt = args.get("custom_prompt", "").strip()
+    first_message = args.get("first_message", "").strip()
+
+    config_override = {}
+    if custom_prompt:
+        config_override["agent"] = config_override.get("agent") or {}
+        config_override["agent"]["prompt"] = {
+            "prompt": custom_prompt
+        }
+    if first_message:
+        config_override["agent"] = config_override.get("agent") or {}
+        config_override["agent"]["first_message"] = first_message
+
+    if config_override:
+        client_data["conversation_config_override"] = config_override
+
+    if "dynamic_variables" in client_data or "conversation_config_override" in client_data:
+        payload["conversation_initiation_client_data"] = client_data
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=20)

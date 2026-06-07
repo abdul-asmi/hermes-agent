@@ -152,3 +152,62 @@ def test_api_failure(mock_post, mock_load_env, mock_get_session_env):
     assert "error" in data
     assert "ElevenLabs API error" in data["error"]
     assert "Bad Request error detail" in data["error"]
+
+@patch("tools.calling_tool.get_session_env")
+@patch("tools.calling_tool.load_hermes_dotenv")
+@patch("tools.calling_tool.requests.post")
+@patch.dict(os.environ, {
+    "ELEVENLABS_API_KEY": "test_key",
+    "ELEVENLABS_AGENT_ID": "default_agent",
+    "ELEVENLABS_ASMI_AGENT_ID": "asmi_agent",
+    "ELEVENLABS_PERSONAL_AGENT_ID": "personal_agent",
+    "ELEVENLABS_PHONE_NUMBER_ID": "test_phone_id"
+})
+def test_make_phone_call_with_options(mock_post, mock_load_env, mock_get_session_env):
+    mock_get_session_env.return_value = "cli"
+    
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"conversation_id": "convo_opts"}
+    mock_post.return_value = mock_resp
+
+    # 1. Test agent_mode = "asmi" and overrides
+    res = make_phone_call({
+        "phone_number": "+14155551234",
+        "agent_mode": "asmi",
+        "custom_prompt": "Override prompt for Asmi",
+        "first_message": "Override first message for Asmi"
+    })
+    data = json.loads(res)
+    assert data.get("success") is True
+    
+    args, kwargs = mock_post.call_args
+    assert kwargs["json"]["agent_id"] == "asmi_agent"
+    
+    client_data = kwargs["json"]["conversation_initiation_client_data"]
+    assert client_data["type"] == "conversation_initiation_client_data"
+    assert client_data["conversation_config_override"]["agent"]["first_message"] == "Override first message for Asmi"
+    assert client_data["conversation_config_override"]["agent"]["prompt"]["prompt"] == "Override prompt for Asmi"
+
+    mock_post.reset_mock()
+
+    # 2. Test agent_mode = "personal"
+    res = make_phone_call({
+        "phone_number": "+14155551234",
+        "agent_mode": "personal"
+    })
+    data = json.loads(res)
+    assert data.get("success") is True
+    assert mock_post.call_args[1]["json"]["agent_id"] == "personal_agent"
+
+    mock_post.reset_mock()
+
+    # 3. Test explicit agent_id argument override
+    res = make_phone_call({
+        "phone_number": "+14155551234",
+        "agent_id": "explicit_agent"
+    })
+    data = json.loads(res)
+    assert data.get("success") is True
+    assert mock_post.call_args[1]["json"]["agent_id"] == "explicit_agent"
+
