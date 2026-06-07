@@ -46,6 +46,9 @@ class TestResolveChannelToolsets:
         assert resolve_channel_toolsets(config_extra, "child-1", parent_id="parent-1") == ["web"]
 
 
+from gateway.config import PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+
 class _CapturingAgent:
     last_init = None
 
@@ -60,6 +63,29 @@ class _CapturingAgent:
             "api_calls": 1,
             "completed": True,
         }
+
+
+class MockWhatsAppAdapter(BasePlatformAdapter):
+    def __init__(self, config=None, platform=None):
+        if config is None:
+            config = PlatformConfig(enabled=True, extra={"channel_toolsets": {"14086689990": ["web"]}})
+        if platform is None:
+            platform = Platform.WHATSAPP
+        super().__init__(config, platform)
+        self.sent_messages = []
+
+    async def connect(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
+        self.sent_messages.append((chat_id, content, reply_to, metadata))
+        return SendResult(success=True, message_id="msg-1")
+
+    async def get_chat_info(self, chat_id: str) -> dict:
+        return {"name": "Mock Chat", "type": "dm"}
 
 
 @pytest.mark.asyncio
@@ -97,11 +123,19 @@ async def test_run_agent_overrides_enabled_toolsets(monkeypatch, tmp_path):
     runner._get_proxy_url = lambda: None
 
     # Mock gateway config loader
-    config_mock = MagicMock()
-    whatsapp_config = MagicMock()
-    whatsapp_config.extra = {"channel_toolsets": {"14086689990": ["web"]}}
-    config_mock.platforms = {Platform.WHATSAPP: whatsapp_config}
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config_mock)
+    user_config_dict = {
+        "platforms": {
+            "whatsapp": {
+                "extra": {
+                    "channel_toolsets": {"14086689990": ["web"]}
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: user_config_dict)
+    
+    whatsapp_adapter = MockWhatsAppAdapter()
+    runner.adapters = {Platform.WHATSAPP: whatsapp_adapter}
     monkeypatch.setattr(gateway_run, "_platform_config_key", lambda p: "whatsapp")
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-mock")
     monkeypatch.setattr(

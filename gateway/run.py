@@ -12652,11 +12652,19 @@ class GatewayRunner:
 
             # Resolve JID-specific toolsets if configured
             channel_toolsets = None
-            adapter_config = user_config.platforms.get(source.platform)
-            if adapter_config and adapter_config.extra:
+            extra_config = None
+            adapter = self.adapters.get(source.platform)
+            if adapter and getattr(adapter, "config", None) and getattr(adapter.config, "extra", None):
+                extra_config = adapter.config.extra
+            else:
+                platform_cfg = user_config.get("platforms", {}).get(platform_key, {})
+                if isinstance(platform_cfg, dict):
+                    extra_config = platform_cfg.get("extra", {})
+
+            if extra_config:
                 from gateway.platforms.base import resolve_channel_toolsets
                 channel_toolsets = resolve_channel_toolsets(
-                    adapter_config.extra,
+                    extra_config,
                     source.chat_id,
                     source.parent_chat_id,
                 )
@@ -17069,11 +17077,19 @@ class GatewayRunner:
 
         # Resolve JID-specific toolsets if configured
         channel_toolsets = None
-        adapter_config = user_config.platforms.get(source.platform)
-        if adapter_config and adapter_config.extra:
+        extra_config = None
+        adapter = self.adapters.get(source.platform)
+        if adapter and getattr(adapter, "config", None) and getattr(adapter.config, "extra", None):
+            extra_config = adapter.config.extra
+        else:
+            platform_cfg = user_config.get("platforms", {}).get(platform_key, {})
+            if isinstance(platform_cfg, dict):
+                extra_config = platform_cfg.get("extra", {})
+
+        if extra_config:
             from gateway.platforms.base import resolve_channel_toolsets
             channel_toolsets = resolve_channel_toolsets(
-                adapter_config.extra,
+                extra_config,
                 source.chat_id,
                 source.parent_chat_id,
             )
