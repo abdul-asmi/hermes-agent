@@ -19,7 +19,7 @@ fallback_providers:
 
 compression:
   enabled: true
-  threshold: 0.35
+  threshold: 0.05
   target_ratio: 0.2
   protect_last_n: 20
 
