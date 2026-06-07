@@ -2100,6 +2100,126 @@ class GatewayRunner:
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
+        # Personal level of authentication / WhatsApp approval gate
+        self._approved_jids = set()
+        self._pending_auth_messages = {}
+        self._last_unauthorized_jid = None
+        self._load_approved_jids()
+
+        # Ensure default roleplay persona exists
+        persona_path = _hermes_home / "roleplay_persona.md"
+        if not persona_path.exists():
+            try:
+                persona_path.write_text(
+                    "# Roleplay Persona\n\n"
+                    "You are a sandboxed testing assistant running under a roleplay personality. "
+                    "You do NOT have access to the user's laptop, files, personal information, or external commands. "
+                    "You must simulate a roleplay partner and adhere strictly to the roleplay instructions provided by the user.\n"
+                )
+            except Exception as e:
+                logger.warning("Failed to create default roleplay_persona.md: %s", e)
+
+    def _load_approved_jids(self):
+        self._approved_jids = set()
+        path = _hermes_home / "approved_jids.json"
+        if path.exists():
+            try:
+                import json
+                data = json.loads(path.read_text())
+                if isinstance(data, list):
+                    self._approved_jids.update(data)
+            except Exception as e:
+                logger.warning("Failed to load approved_jids.json: %s", e)
+
+    def _save_approved_jids(self):
+        path = _hermes_home / "approved_jids.json"
+        try:
+            import json
+            path.write_text(json.dumps(list(self._approved_jids)))
+        except Exception as e:
+            logger.warning("Failed to save approved_jids.json: %s", e)
+
+    async def _generate_and_send_analysis(self, target_jid: str, chat_id: str, platform: Platform):
+        """Generates evaluation analysis for a JID's session and sends it back to the owner."""
+        try:
+            from gateway.platforms.base import SessionSource
+            from run_agent import AIAgent
+
+            # Ensure target JID format
+            full_target_jid = target_jid if "@" in target_jid else f"{target_jid}@s.whatsapp.net"
+            target_source = SessionSource(
+                platform=Platform.WHATSAPP,
+                chat_id=full_target_jid,
+                chat_type="dm",
+                user_id=full_target_jid,
+            )
+
+            # Retrieve its session
+            session_entry = self.session_store.get_or_create_session(target_source)
+            history = self.session_store.load_transcript(session_entry.session_id)
+
+            if not history:
+                adapter = self.adapters.get(platform)
+                if adapter:
+                    await adapter.send(chat_id, f"📝 No conversation history found for WhatsApp user '{target_jid}'.")
+                return
+
+            # Format transcript text
+            transcript_lines = []
+            for m in history:
+                role = m.get("role", "unknown").upper()
+                content = m.get("content", "")
+                if content:
+                    transcript_lines.append(f"{role}: {content}")
+            transcript_text = "\n\n".join(transcript_lines)
+
+            # Prepare AIAgent execution using owner's config but targeted
+            user_config = _load_gateway_config()
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=target_source,
+                user_config=user_config,
+            )
+
+            analysis_prompt = (
+                f"You are an expert evaluator. Analyze the following transcript of a session with the Hermes agent. "
+                f"Provide an evaluation report in markdown format. Summarize the conversation, assess its performance, "
+                f"identify any issues or abnormalities, and provide recommendations.\n\n"
+                f"TRANSCRIPT:\n{transcript_text}"
+            )
+
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=5,
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=[],  # No tools for evaluation
+                ephemeral_system_prompt="You are a helpful, precise evaluator AI.",
+                session_id=f"eval-{session_entry.session_id}",
+            )
+
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(
+                None,
+                lambda: agent.run_conversation(analysis_prompt)
+            )
+
+            report = res.get("final_response", "Failed to generate evaluation report.")
+
+            adapter = self.adapters.get(platform)
+            if adapter:
+                await adapter.send(
+                    chat_id,
+                    f"📊 *Evaluation Report for WhatsApp User {target_jid}*:\n\n{report}"
+                )
+        except Exception as e:
+            logger.error("Error in generating and sending analysis for %s: %s", target_jid, e, exc_info=True)
+            adapter = self.adapters.get(platform)
+            if adapter:
+                await adapter.send(
+                    chat_id,
+                    f"❌ Error generating evaluation report for '{target_jid}': {str(e)}"
+                )
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -7436,6 +7556,136 @@ class GatewayRunner:
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
+        # WhatsApp approval gate interceptor
+        if not is_internal and source.platform == Platform.WHATSAPP:
+            # 1. Determine if this message is from the owner
+            user_id = str(source.user_id or "")
+            chat_id = str(source.chat_id or "")
+            is_from_owner = False
+            for id_str in [user_id, chat_id]:
+                clean_id = id_str.split("@")[0]
+                if clean_id in {"918639228484", "197602905739324"}:
+                    is_from_owner = True
+                    break
+            
+            # 2. If it is from the owner, handle the 'start' command if sent
+            if is_from_owner:
+                text_content = (event.text or "").strip().lower()
+                if text_content.startswith("start"):
+                    parts = text_content.split()
+                    if len(parts) > 1:
+                        target_jid = parts[1]
+                    else:
+                        target_jid = getattr(self, "_last_unauthorized_jid", None)
+                    
+                    if target_jid:
+                        clean_target = target_jid.split("@")[0]
+                        if not hasattr(self, "_approved_jids"):
+                            self._approved_jids = set()
+                        self._approved_jids.add(clean_target)
+                        self._save_approved_jids()
+                        
+                        # Notify the owner of approval success
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(
+                                source.chat_id,
+                                f"✅ Approved WhatsApp user '{clean_target}'. They can now interact with Hermes."
+                            )
+                        
+                        # Process any queued message from this target JID
+                        pending_event = self._pending_auth_messages.pop(clean_target, None)
+                        if pending_event:
+                            # Run it asynchronously
+                            asyncio.create_task(self._handle_message(pending_event))
+                        return ""
+                    else:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(
+                                source.chat_id,
+                                "❌ No pending unauthorized JID found. Please specify target: 'start <number>'."
+                            )
+                        return ""
+                elif text_content.startswith("stop"):
+                    parts = text_content.split()
+                    if len(parts) > 1:
+                        target_jid = parts[1]
+                    else:
+                        non_owners = [jid for jid in self._approved_jids if jid not in {"918639228484", "197602905739324"}]
+                        if len(non_owners) == 1:
+                            target_jid = non_owners[0]
+                        else:
+                            target_jid = getattr(self, "_last_unauthorized_jid", None)
+                    
+                    if target_jid:
+                        clean_target = target_jid.split("@")[0]
+                        if not hasattr(self, "_approved_jids"):
+                            self._approved_jids = set()
+                        
+                        if clean_target in self._approved_jids:
+                            self._approved_jids.discard(clean_target)
+                            self._save_approved_jids()
+                            
+                            # Notify owner immediately of revocation
+                            adapter = self.adapters.get(source.platform)
+                            if adapter:
+                                await adapter.send(
+                                    source.chat_id,
+                                    f"🛑 Revoked WhatsApp user '{clean_target}'. Generating session evaluation now..."
+                                )
+                            
+                            # Run evaluation and send analysis asynchronously
+                            asyncio.create_task(
+                                self._generate_and_send_analysis(clean_target, source.chat_id, source.platform)
+                            )
+                        else:
+                            adapter = self.adapters.get(source.platform)
+                            if adapter:
+                                await adapter.send(
+                                    source.chat_id,
+                                    f"❌ WhatsApp user '{clean_target}' is not in the approved list."
+                                )
+                        return ""
+                    else:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(
+                                source.chat_id,
+                                "❌ No active JID to revoke. Please specify: 'stop <number>'."
+                            )
+                        return ""
+            
+            # 3. If it is not from the owner, check if it is approved
+            else:
+                sender_id = chat_id if chat_id else user_id
+                clean_sender = sender_id.split("@")[0]
+                if not hasattr(self, "_approved_jids"):
+                    self._approved_jids = set()
+                
+                if clean_sender not in self._approved_jids:
+                    # Not approved! Hold and notify owner.
+                    self._pending_auth_messages[clean_sender] = event
+                    self._last_unauthorized_jid = clean_sender
+                    
+                    logger.info("Blocked unauthorized WhatsApp sender %s; holding message", clean_sender)
+                    
+                    # Notify the owner(s)
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        owner_destinations = ["918639228484@s.whatsapp.net", "197602905739324@lid"]
+                        for dest in owner_destinations:
+                            try:
+                                await adapter.send(
+                                    dest,
+                                    f"⚠️ Unauthorized WhatsApp message from {clean_sender}:\n"
+                                    f"\"{event.text}\"\n\n"
+                                    f"Reply 'start {clean_sender}' (or just 'start') to approve and respond."
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to send auth notification to %s: %s", dest, e)
+                    return ""
+
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
@@ -8864,6 +9114,7 @@ class GatewayRunner:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.config import Platform
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -9497,6 +9748,37 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
+
+            # Override context_prompt for non-owner WhatsApp JIDs with the roleplay persona
+            from gateway.config import Platform
+            is_non_owner_whatsapp = False
+            if source.platform == Platform.WHATSAPP:
+                user_id = str(source.user_id or "")
+                chat_id = str(source.chat_id or "")
+                is_owner = False
+                for id_str in [user_id, chat_id]:
+                    clean_id = id_str.split("@")[0]
+                    if clean_id in {"918639228484", "197602905739324"}:
+                        is_owner = True
+                        break
+                if not is_owner:
+                    is_non_owner_whatsapp = True
+
+            if is_non_owner_whatsapp:
+                persona_path = _hermes_home / "roleplay_persona.md"
+                if persona_path.exists():
+                    try:
+                        context_prompt = persona_path.read_text()
+                        logger.info("Overriding context prompt with roleplay persona for %s", source.user_id)
+                    except Exception as e:
+                        logger.warning("Failed to read roleplay_persona.md: %s", e)
+                else:
+                    context_prompt = (
+                        "# Roleplay Persona\n\n"
+                        "You are a sandboxed testing assistant running under a roleplay personality. "
+                        "You do NOT have access to the user's laptop, files, personal information, or external commands. "
+                        "You must simulate a roleplay partner and adhere strictly to the roleplay instructions provided by the user."
+                    )
 
             # Run the agent
             agent_result = await self._run_agent(
@@ -12677,6 +12959,39 @@ class GatewayRunner:
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
+            # Check if non-owner WhatsApp JID to strip tools for strict sandboxing
+            from gateway.config import Platform
+            is_non_owner_whatsapp = False
+            if source.platform == Platform.WHATSAPP:
+                user_id = str(source.user_id or "")
+                chat_id = str(source.chat_id or "")
+                is_owner = False
+                for id_str in [user_id, chat_id]:
+                    clean_id = id_str.split("@")[0]
+                    if clean_id in {"918639228484", "197602905739324"}:
+                        is_owner = True
+                        break
+                if not is_owner:
+                    is_non_owner_whatsapp = True
+
+            ephemeral_prompt = None
+            if is_non_owner_whatsapp:
+                enabled_toolsets = []
+                disabled_toolsets = None
+                persona_path = _hermes_home / "roleplay_persona.md"
+                if persona_path.exists():
+                    try:
+                        ephemeral_prompt = persona_path.read_text()
+                    except Exception as e:
+                        logger.warning("Failed to read roleplay_persona.md in background task: %s", e)
+                if not ephemeral_prompt:
+                    ephemeral_prompt = (
+                        "# Roleplay Persona\n\n"
+                        "You are a sandboxed testing assistant running under a roleplay personality. "
+                        "You do NOT have access to the user's laptop, files, personal information, or external commands. "
+                        "You must simulate a roleplay partner and adhere strictly to the roleplay instructions provided by the user."
+                    )
+
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._resolve_session_reasoning_config(source=source)
@@ -12710,6 +13025,7 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    ephemeral_system_prompt=ephemeral_prompt,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -17102,6 +17418,25 @@ class GatewayRunner:
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
+        # Check if non-owner WhatsApp JID to strip tools for strict sandboxing
+        from gateway.config import Platform
+        is_non_owner_whatsapp = False
+        if source.platform == Platform.WHATSAPP:
+            user_id = str(source.user_id or "")
+            chat_id = str(source.chat_id or "")
+            is_owner = False
+            for id_str in [user_id, chat_id]:
+                clean_id = id_str.split("@")[0]
+                if clean_id in {"918639228484", "197602905739324"}:
+                    is_owner = True
+                    break
+            if not is_owner:
+                is_non_owner_whatsapp = True
+
+        if is_non_owner_whatsapp:
+            enabled_toolsets = []
+            disabled_toolsets = None
+
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
             display_config = {}
@@ -17803,11 +18138,12 @@ class GatewayRunner:
             # Combine platform context, per-channel context, and the user-configured
             # ephemeral system prompt.
             combined_ephemeral = context_prompt or ""
-            event_channel_prompt = (channel_prompt or "").strip()
-            if event_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            if self._ephemeral_system_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            if not is_non_owner_whatsapp:
+                event_channel_prompt = (channel_prompt or "").strip()
+                if event_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+                if self._ephemeral_system_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
