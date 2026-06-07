@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Outbound voice calling
+    "make_phone_call",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -86,6 +88,11 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
+    "calling": {
+        "description": "Outbound voice calling via ElevenLabs Conversational AI",
+        "tools": ["make_phone_call"],
+        "includes": []
+    },
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",

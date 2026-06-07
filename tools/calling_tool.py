@@ -1,0 +1,326 @@
+"""Calling Tool -- initiate outbound phone calls via ElevenLabs Conversational AI."""
+
+import os
+import re
+import json
+import logging
+import requests
+import threading
+import time
+from typing import Dict, Any, Optional
+
+from tools.registry import registry, tool_error, tool_result
+from gateway.session_context import get_session_env
+from hermes_cli.env_loader import load_hermes_dotenv
+
+logger = logging.getLogger(__name__)
+
+# Load dotenv to ensure keys are available at module level
+load_hermes_dotenv()
+
+CALLING_SCHEMA = {
+    "name": "make_phone_call",
+    "description": (
+        "Initiates an outbound phone call to the specified phone number using the ElevenLabs "
+        "Conversational AI agent. "
+        "If no phone_number is provided (or if the user requests to call 'me' or 'myself'), "
+        "it will call the owner's configured personal phone number. "
+        "Access to this tool is restricted: only the owner can trigger calls."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "phone_number": {
+                "type": "string",
+                "description": (
+                    "The recipient's phone number in E.164 format (e.g. +14155551234). "
+                    "Omit or use 'me' / 'myself' to call the owner's configured personal number."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "The brief reason, context, or purpose for the call. Highly recommended to include.",
+            },
+        },
+        "required": [],
+    },
+}
+
+def check_calling_requirements() -> bool:
+    """Check if outbound calling requirements are met."""
+    load_hermes_dotenv()
+    return all(os.environ.get(k) for k in ["ELEVENLABS_API_KEY", "ELEVENLABS_AGENT_ID", "ELEVENLABS_PHONE_NUMBER_ID"])
+
+def _clean_phone_number(num: str) -> str:
+    """Clean and format phone number to E.164 format."""
+    cleaned = re.sub(r"[^\d+]", "", num)
+    if not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+    return cleaned
+
+def _format_transcript(transcript_list: list) -> str:
+    """Format ElevenLabs transcript list into a readable string."""
+    if not transcript_list:
+        return "(no transcript captured)"
+    lines = []
+    for turn in transcript_list:
+        role = str(turn.get("role") or turn.get("speaker") or "unknown").lower()
+        text = str(turn.get("message") or turn.get("text") or "").strip()
+        label = "User" if role in {"user", "caller"} else "ElevenLabs Agent"
+        if text:
+            lines.append(f"- *{label}*: {text}")
+    return "\n".join(lines)
+
+def _poll_and_deliver_call(conversation_id: str, platform: str, chat_id: str, api_key: str):
+    """Background thread to poll ElevenLabs, fetch the call summary, download the recording, and send them to the user."""
+    logger.info(f"Started background polling for ElevenLabs conversation {conversation_id}")
+    
+    url = f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}"
+    headers = {"xi-api-key": api_key}
+    
+    # 1. Poll until the conversation is completed or timeout is reached
+    timeout_seconds = 300
+    poll_interval = 5
+    elapsed = 0
+    status = "unknown"
+    detail = {}
+    
+    while elapsed < timeout_seconds:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                detail = resp.json()
+                status = str(detail.get("status") or "").lower().strip()
+                if status in {"done", "completed", "finished", "ended", "failed", "error", "aborted"}:
+                    logger.info(f"Conversation {conversation_id} completed with status: {status}")
+                    break
+            else:
+                logger.warning(f"Error polling conversation {conversation_id}: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Exception polling conversation {conversation_id}: {e}")
+            
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        
+    if status not in {"done", "completed", "finished", "ended"}:
+        logger.warning(f"Conversation {conversation_id} did not complete successfully or timed out. Status: {status}")
+        if platform == "whatsapp" and chat_id:
+            # Notify user of failure
+            _send_whatsapp_text(chat_id, f"📞 *Call Update*\n\nOutbound call failed or ended unexpectedly.\n*Status:* {status}")
+        return
+        
+    # Wait another 5 seconds for ElevenLabs post-processing/summary/audio generation
+    time.sleep(5)
+    
+    try:
+        # Refetch final detail
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            detail = resp.json()
+            
+        analysis = detail.get("analysis") or {}
+        title = analysis.get("call_summary_title") or "ElevenLabs Call"
+        summary = analysis.get("transcript_summary") or "(No summary generated by ElevenLabs)"
+        transcript = detail.get("transcript") or []
+        
+        metadata = detail.get("metadata") or {}
+        duration = metadata.get("call_duration_secs") or detail.get("call_duration_secs") or detail.get("duration_secs") or "unknown"
+        
+        # Download call recording
+        audio_url = f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}/audio"
+        audio_resp = requests.get(audio_url, headers=headers, timeout=30)
+        
+        audio_path = None
+        if audio_resp.status_code == 200:
+            audio_dir = os.path.expanduser("~/.hermes/audio_cache")
+            os.makedirs(audio_dir, exist_ok=True)
+            audio_path = os.path.join(audio_dir, f"call_{conversation_id}.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(audio_resp.content)
+            logger.info(f"Downloaded call recording to {audio_path}")
+        else:
+            logger.warning(f"Failed to download call recording: {audio_resp.status_code}")
+            
+        # Format the transcript text
+        formatted_transcript = _format_transcript(transcript)
+        
+        # Build the summary report message
+        report = (
+            f"📞 *Call Summary: {title}*\n"
+            f"──────────────\n"
+            f"*Duration:* {duration}s\n"
+            f"*Status:* {status}\n\n"
+            f"*ElevenLabs Summary:*\n{summary}\n\n"
+            f"*Transcript:*\n{formatted_transcript}"
+        )
+        
+        # Deliver via WhatsApp
+        if platform == "whatsapp" and chat_id:
+            # Send the text summary
+            _send_whatsapp_text(chat_id, report)
+            
+            # Send the audio file if downloaded successfully
+            if audio_path and os.path.exists(audio_path):
+                _send_whatsapp_audio(chat_id, audio_path)
+        else:
+            logger.info(f"Call report generated for CLI:\n{report}")
+            if audio_path:
+                logger.info(f"Audio file saved at: {audio_path}")
+                
+    except Exception as e:
+        logger.exception(f"Error during post-call delivery for {conversation_id}: {e}")
+
+def _get_bridge_port() -> int:
+    """Get the local WhatsApp bridge port from config."""
+    bridge_port = 3000
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+        pconfig = config.platforms.get(Platform.WHATSAPP)
+        if pconfig and pconfig.extra:
+            bridge_port = pconfig.extra.get("bridge_port", 3000)
+    except Exception:
+        pass
+    return bridge_port
+
+def _send_whatsapp_text(chat_id: str, message: str):
+    """Post text message to local WhatsApp bridge."""
+    port = _get_bridge_port()
+    try:
+        requests.post(
+            f"http://localhost:{port}/send",
+            json={"chatId": chat_id, "message": message},
+            timeout=15
+        )
+    except Exception as e:
+        logger.error(f"Failed to send background text to bridge: {e}")
+
+def _send_whatsapp_audio(chat_id: str, file_path: str):
+    """Post audio file to local WhatsApp bridge."""
+    port = _get_bridge_port()
+    try:
+        requests.post(
+            f"http://localhost:{port}/send-media",
+            json={"chatId": chat_id, "filePath": file_path, "mediaType": "audio"},
+            timeout=60
+        )
+    except Exception as e:
+        logger.error(f"Failed to send background audio to bridge: {e}")
+
+def make_phone_call(args: dict, **kwargs) -> str:
+    """Execute the outbound phone call."""
+    # 1. Enforce access control / authorization gate
+    platform = get_session_env("HERMES_SESSION_PLATFORM")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+    user_id = get_session_env("HERMES_SESSION_USER_ID")
+
+    is_authorized = False
+    if not platform or platform.lower() in {"cli", "terminal"}:
+        is_authorized = True
+    elif platform.lower() == "whatsapp":
+        owner_jid = "197602905739324@lid"
+        if chat_id == owner_jid or user_id == owner_jid:
+            is_authorized = True
+
+    if not is_authorized:
+        logger.warning(
+            f"Unauthorized phone call attempt from platform={platform}, chat_id={chat_id}, user_id={user_id}"
+        )
+        return tool_error("Unauthorized. Calling features are restricted to the owner.")
+
+    # 2. Check and load environment variables
+    load_hermes_dotenv()
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
+    phone_number_id = os.environ.get("ELEVENLABS_PHONE_NUMBER_ID")
+    personal_number = os.environ.get("USER_PERSONAL_PHONE_NUMBER")
+
+    if not all([api_key, agent_id, phone_number_id]):
+        return tool_error(
+            "Outbound call configuration is incomplete. "
+            "Please check ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, and ELEVENLABS_PHONE_NUMBER_ID."
+        )
+
+    # 3. Determine target number
+    phone_param = args.get("phone_number", "").strip()
+    reason = args.get("reason", "").strip()
+
+    target_number = ""
+    if not phone_param or phone_param.lower() in {"me", "myself"}:
+        if not personal_number:
+            return tool_error("USER_PERSONAL_PHONE_NUMBER is not configured.")
+        target_number = personal_number
+    else:
+        target_number = phone_param
+
+    # Clean and normalize the number
+    try:
+        target_number = _clean_phone_number(target_number)
+    except Exception as e:
+        return tool_error(f"Failed to parse phone number: {e}")
+
+    # Validate target number length/format
+    if len(target_number) < 8 or not re.match(r"^\+\d+$", target_number):
+        return tool_error(f"Invalid E.164 phone number: {target_number}")
+
+    # 4. Trigger the outbound call
+    url = "https://api.elevenlabs.io/v1/convai/twilio/outbound-call"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "agent_id": agent_id,
+        "agent_phone_number_id": phone_number_id,
+        "to_number": target_number
+    }
+
+    # Pass optional context if reason is provided
+    if reason:
+        payload["conversation_initiation_client_data"] = {
+            "custom_vars": {
+                "reason": reason,
+                "context": reason
+            }
+        }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            convo_id = data.get("conversation_id", "")
+            logger.info(f"Phone call initiated successfully to {target_number}. Conversation ID: {convo_id}")
+            
+            # Start background thread to poll and deliver summary/recording
+            threading.Thread(
+                target=_poll_and_deliver_call,
+                args=(convo_id, platform, chat_id or user_id, api_key),
+                daemon=True
+            ).start()
+            
+            return tool_result(
+                success=True,
+                message=f"Phone call successfully initiated to {target_number}.",
+                conversation_id=convo_id
+            )
+        else:
+            try:
+                err_detail = resp.json().get("detail", {}).get("message") or resp.text
+            except Exception:
+                err_detail = resp.text
+            logger.error(f"ElevenLabs outbound call failed: code={resp.status_code} detail={err_detail}")
+            return tool_error(f"ElevenLabs API error (code {resp.status_code}): {err_detail}")
+    except Exception as e:
+        logger.exception(f"Exception triggered during outbound call: {e}")
+        return tool_error(f"Failed to place outbound call: {e}")
+
+# Register the tool
+registry.register(
+    name="make_phone_call",
+    toolset="calling",
+    schema=CALLING_SCHEMA,
+    handler=make_phone_call,
+    check_fn=check_calling_requirements,
+    requires_env=["ELEVENLABS_API_KEY", "ELEVENLABS_AGENT_ID", "ELEVENLABS_PHONE_NUMBER_ID"],
+    emoji="📞",
+)
