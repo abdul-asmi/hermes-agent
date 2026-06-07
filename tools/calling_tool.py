@@ -278,7 +278,8 @@ def make_phone_call(args: dict, **kwargs) -> str:
     # Pass optional context if reason is provided
     if reason:
         payload["conversation_initiation_client_data"] = {
-            "custom_vars": {
+            "type": "conversation_initiation_client_data",
+            "dynamic_variables": {
                 "reason": reason,
                 "context": reason
             }

@@ -91,7 +91,9 @@ def test_authorized_cli_success(mock_post, mock_load_env, mock_get_session_env):
     assert kwargs["json"]["to_number"] == "+19999999999"
     assert kwargs["json"]["agent_id"] == "test_agent"
     assert kwargs["json"]["agent_phone_number_id"] == "test_phone_id"
-    assert kwargs["json"]["conversation_initiation_client_data"]["custom_vars"]["reason"] == "Test outbound call"
+    assert kwargs["json"]["conversation_initiation_client_data"]["type"] == "conversation_initiation_client_data"
+    assert kwargs["json"]["conversation_initiation_client_data"]["dynamic_variables"]["reason"] == "Test outbound call"
+    assert kwargs["json"]["conversation_initiation_client_data"]["dynamic_variables"]["context"] == "Test outbound call"
 
 @patch("tools.calling_tool.get_session_env")
 @patch("tools.calling_tool.load_hermes_dotenv")
