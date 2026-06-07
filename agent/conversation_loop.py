@@ -428,6 +428,25 @@ def run_conversation(
     # runtime so this turn gets a fresh attempt with the preferred model.
     # No-op when _fallback_activated is False (gateway, first turn, etc.).
     agent._restore_primary_runtime()
+    try:
+        from agent.model_cooldown import activate_available_fallback
+
+        cooldown_fallback_activated = activate_available_fallback(agent)
+        if cooldown_fallback_activated:
+            try:
+                from agent.auxiliary_client import set_runtime_main
+
+                set_runtime_main(
+                    getattr(agent, "provider", "") or "",
+                    getattr(agent, "model", "") or "",
+                    base_url=getattr(agent, "base_url", "") or "",
+                    api_key=getattr(agent, "api_key", "") or "",
+                    api_mode=getattr(agent, "api_mode", "") or "",
+                )
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("Could not apply persistent model cooldown", exc_info=True)
 
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
@@ -2895,6 +2914,21 @@ def run_conversation(
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
                 }
+                if classified.reason == FailoverReason.rate_limit:
+                    try:
+                        from agent.model_cooldown import record_model_cooldown
+
+                        record_model_cooldown(
+                            agent.provider,
+                            agent.model,
+                            str(api_error),
+                            retry_after=getattr(api_error, "retry_after", None),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not persist model cooldown",
+                            exc_info=True,
+                        )
                 if is_rate_limited and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
                     # still recover.  See _pool_may_recover_from_rate_limit

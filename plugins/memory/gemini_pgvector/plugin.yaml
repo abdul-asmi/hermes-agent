@@ -1,0 +1,5 @@
+name: gemini_pgvector
+version: 1.0.0
+description: "Automatic Hermes memory using Gemini Embedding 2 and PostgreSQL pgvector."
+pip_dependencies:
+  - "psycopg[binary]>=3.2,<4"

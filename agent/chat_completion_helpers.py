@@ -1032,6 +1032,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback()  # skip invalid, try next
+    try:
+        from agent.model_cooldown import (
+            format_cooldown,
+            get_active_model_cooldown,
+        )
+
+        cooldown = get_active_model_cooldown(fb_provider, fb_model)
+        if cooldown:
+            logger.info(
+                "Fallback skip: %s/%s is in cooldown (%s)",
+                fb_provider,
+                fb_model,
+                format_cooldown(cooldown),
+            )
+            return agent._try_activate_fallback()
+    except Exception:
+        logger.debug("Could not inspect fallback model cooldown", exc_info=True)
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
