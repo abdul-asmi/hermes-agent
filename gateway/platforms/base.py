@@ -1452,6 +1452,10 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Per-channel toolsets restriction (e.g. WhatsApp channel_toolsets).
+    # Applied at session run time.
+    channel_toolsets: Optional[List[str]] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the
@@ -1708,6 +1712,37 @@ def resolve_channel_prompt(
         prompt = str(prompt).strip()
         if prompt:
             return prompt
+    return None
+
+
+def resolve_channel_toolsets(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> list[str] | None:
+    """Resolve per-channel toolsets from platform config.
+
+    Looks up ``channel_toolsets`` in the adapter's ``config.extra`` dict.
+    Prefers an exact match on *channel_id*; falls back to *parent_id*.
+
+    Returns the list of toolsets (or an empty list to disable all tools),
+    or None if no match is configured.
+    """
+    toolsets = config_extra.get("channel_toolsets") or {}
+    if not isinstance(toolsets, dict):
+        return None
+
+    for key in (channel_id, parent_id):
+        if not key:
+            continue
+        if key in toolsets:
+            val = toolsets[key]
+            if val is None:
+                return []
+            if isinstance(val, list):
+                return [str(x).strip() for x in val]
+            if isinstance(val, str):
+                return [x.strip() for x in val.split(",") if x.strip()]
     return None
 
 

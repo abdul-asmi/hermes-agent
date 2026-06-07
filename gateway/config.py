@@ -920,6 +920,12 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if "channel_toolsets" in platform_cfg:
+                    channel_toolsets = platform_cfg["channel_toolsets"]
+                    if isinstance(channel_toolsets, dict):
+                        bridged["channel_toolsets"] = {str(k): v for k, v in channel_toolsets.items()}
+                    else:
+                        bridged["channel_toolsets"] = channel_toolsets
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg

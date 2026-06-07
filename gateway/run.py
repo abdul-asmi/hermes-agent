@@ -12650,8 +12650,22 @@ class GatewayRunner:
 
             platform_key = _platform_config_key(source.platform)
 
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            # Resolve JID-specific toolsets if configured
+            channel_toolsets = None
+            adapter_config = user_config.platforms.get(source.platform)
+            if adapter_config and adapter_config.extra:
+                from gateway.platforms.base import resolve_channel_toolsets
+                channel_toolsets = resolve_channel_toolsets(
+                    adapter_config.extra,
+                    source.chat_id,
+                    source.parent_chat_id,
+                )
+
+            if channel_toolsets is not None:
+                enabled_toolsets = sorted(channel_toolsets)
+            else:
+                from hermes_cli.tools_config import _get_platform_tools
+                enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -17053,8 +17067,22 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        # Resolve JID-specific toolsets if configured
+        channel_toolsets = None
+        adapter_config = user_config.platforms.get(source.platform)
+        if adapter_config and adapter_config.extra:
+            from gateway.platforms.base import resolve_channel_toolsets
+            channel_toolsets = resolve_channel_toolsets(
+                adapter_config.extra,
+                source.chat_id,
+                source.parent_chat_id,
+            )
+
+        if channel_toolsets is not None:
+            enabled_toolsets = sorted(channel_toolsets)
+        else:
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
