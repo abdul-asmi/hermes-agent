@@ -227,6 +227,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         res.raise_for_status()
         return res.json()
 
+    async def _get_message(self, guid: str) -> Optional[Dict[str, Any]]:
+        """Retrieve details of a single message from the BlueBubbles REST API."""
+        if not self.client:
+            return None
+        try:
+            encoded = quote(guid, safe="")
+            res = await self._api_get(f"/api/v1/message/{encoded}")
+            if isinstance(res, dict) and "data" in res:
+                return res["data"]
+        except Exception as exc:
+            logger.warning("[bluebubbles] failed to fetch message %s: %s", guid, exc)
+        return None
+
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1010,6 +1024,30 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             user_name=sender,
             chat_id_alt=chat_identifier,
         )
+        reply_to_guid = self._value(
+            record.get("threadOriginatorGuid"),
+            record.get("associatedMessageGuid"),
+        )
+        reply_to_text = None
+        if reply_to_guid and self.client:
+            try:
+                parent_msg = await self._get_message(reply_to_guid)
+                if parent_msg:
+                    raw_text = (
+                        parent_msg.get("text")
+                        or parent_msg.get("body")
+                        or parent_msg.get("subject")
+                        or ""
+                    )
+                    if isinstance(raw_text, str) and raw_text.strip():
+                        reply_to_text = raw_text.strip()
+            except Exception as exc:
+                logger.warning(
+                    "[bluebubbles] failed to fetch parent message %s context: %s",
+                    reply_to_guid,
+                    exc,
+                )
+
         event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -1020,10 +1058,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 record.get("messageGuid"),
                 record.get("id"),
             ),
-            reply_to_message_id=self._value(
-                record.get("threadOriginatorGuid"),
-                record.get("associatedMessageGuid"),
-            ),
+            reply_to_message_id=reply_to_guid,
+            reply_to_text=reply_to_text,
             media_urls=media_urls,
             media_types=media_types,
         )

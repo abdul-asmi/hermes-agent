@@ -830,3 +830,93 @@ class TestBlueBubblesWebhookRegistration:
             adapter._unregister_webhook()
         )
         assert ok is False
+
+
+class TestBlueBubblesReplyContext:
+    @pytest.mark.asyncio
+    async def test_webhook_retrieves_reply_to_text(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention=False,
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        # Mock self.client to look like it is connected so the webhook code goes to REST API
+        adapter.client = type("MockClient", (), {})()
+
+        # Mock _get_message
+        async def mock_get_message(guid):
+            if guid == "parent-guid-123":
+                return {"guid": "parent-guid-123", "text": "This is the quoted message"}
+            return None
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "_get_message", mock_get_message)
+
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-reply",
+                "text": "Yes, I agree",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatGuid": "iMessage;-;user@example.com",
+                "chatIdentifier": "user@example.com",
+                "associatedMessageGuid": "parent-guid-123",
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert len(handled) == 1
+        event = handled[0]
+        assert event.text == "Yes, I agree"
+        assert event.reply_to_message_id == "parent-guid-123"
+        assert event.reply_to_text == "This is the quoted message"
+
+    @pytest.mark.asyncio
+    async def test_webhook_handles_missing_parent_message_gracefully(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            require_mention=False,
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        adapter.client = type("MockClient", (), {})()
+
+        # Mock _get_message returning None to simulate API error / missing message
+        async def mock_get_message(guid):
+            return None
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "_get_message", mock_get_message)
+
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-reply",
+                "text": "Yes, I agree",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatGuid": "iMessage;-;user@example.com",
+                "chatIdentifier": "user@example.com",
+                "associatedMessageGuid": "missing-parent-guid",
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert len(handled) == 1
+        event = handled[0]
+        assert event.text == "Yes, I agree"
+        assert event.reply_to_message_id == "missing-parent-guid"
+        assert event.reply_to_text is None
+
