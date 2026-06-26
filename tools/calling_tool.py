@@ -1,10 +1,13 @@
 """Calling Tool -- initiate outbound phone calls via ElevenLabs Conversational AI."""
 
+import asyncio
+import concurrent.futures
 import os
 import re
 import json
 import logging
 import requests
+import subprocess
 import threading
 import time
 from typing import Dict, Any, Optional
@@ -181,11 +184,14 @@ def _poll_and_deliver_call(conversation_id: str, platform: str, chat_id: str, ap
             f"*Transcript:*\n{formatted_transcript}"
         )
         
-        # Deliver via WhatsApp
-        if platform == "whatsapp" and chat_id:
+        # Deliver to the originating platform
+        if platform == "bluebubbles" and chat_id:
+            caf_path = _mp3_to_caf(audio_path) if audio_path else None
+            _send_bluebubbles_audio(chat_id, caf_path, audio_path, report)
+        elif platform == "whatsapp" and chat_id:
             # Send the text summary
             _send_whatsapp_text(chat_id, report)
-            
+
             # Send the audio file if downloaded successfully
             if audio_path and os.path.exists(audio_path):
                 _send_whatsapp_audio(chat_id, audio_path)
@@ -233,6 +239,112 @@ def _send_whatsapp_audio(chat_id: str, file_path: str):
         )
     except Exception as e:
         logger.error(f"Failed to send background audio to bridge: {e}")
+
+
+def _mp3_to_caf(mp3_path: str) -> Optional[str]:
+    """Convert an MP3 file to CAF (Core Audio Format) for native iMessage audio bubbles.
+
+    Tries afconvert (macOS built-in) first, then ffmpeg as a fallback.
+    Returns the CAF file path on success, None if conversion is unavailable.
+    """
+    caf_path = mp3_path.rsplit(".", 1)[0] + ".caf"
+    try:
+        result = subprocess.run(
+            ["afconvert", "-f", "caff", "-d", "LEI16", "-c", "1", mp3_path, caf_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and os.path.isfile(caf_path):
+            logger.info(f"afconvert: {mp3_path} → {caf_path}")
+            return caf_path
+        logger.warning(
+            "afconvert failed (rc=%d): %s",
+            result.returncode,
+            result.stderr.decode(errors="replace"),
+        )
+    except FileNotFoundError:
+        logger.debug("afconvert not found, trying ffmpeg")
+    except Exception as exc:
+        logger.warning("afconvert error: %s", exc)
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", mp3_path, "-ar", "22050", "-ac", "1",
+             "-acodec", "pcm_s16le", caf_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and os.path.isfile(caf_path):
+            logger.info(f"ffmpeg: {mp3_path} → {caf_path}")
+            return caf_path
+        logger.warning(
+            "ffmpeg failed (rc=%d): %s",
+            result.returncode,
+            result.stderr.decode(errors="replace"),
+        )
+    except FileNotFoundError:
+        logger.debug("ffmpeg not found")
+    except Exception as exc:
+        logger.warning("ffmpeg error: %s", exc)
+
+    return None
+
+
+def _send_bluebubbles_audio(chat_id: str, caf_path: Optional[str], mp3_path: Optional[str], report: str) -> None:
+    """Deliver a call recording to an iMessage chat via the live BlueBubbles adapter.
+
+    Sends the text summary first, then attempts to upload the audio as a native
+    iMessage voice-memo bubble (CAF + isAudioMessage=true). Falls back to sending
+    the MP3 as a generic document attachment if native send fails or CAF is unavailable.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+
+    if runner is None:
+        logger.warning("[calling] No gateway runner available for BlueBubbles delivery")
+        return
+
+    try:
+        from gateway.config import Platform
+        adapter = runner.adapters.get(Platform.BLUEBUBBLES)
+    except Exception:
+        adapter = None
+
+    if adapter is None:
+        logger.warning("[calling] BlueBubbles adapter not available")
+        return
+
+    loop = getattr(runner, "_gateway_loop", None)
+    if loop is None or loop.is_closed():
+        logger.warning("[calling] Gateway event loop not available for BlueBubbles delivery")
+        return
+
+    async def _deliver():
+        await adapter.send(chat_id, report)
+
+        # Try native audio bubble first (CAF)
+        if caf_path and os.path.isfile(caf_path):
+            result = await adapter.send_voice(chat_id, caf_path)
+            if result.success:
+                logger.info("[calling] Native iMessage audio bubble sent: %s", caf_path)
+                return
+            logger.warning("[calling] Native audio send failed: %s — falling back to attachment", result.error)
+
+        # Fall back to generic attachment (MP3 or whatever we have)
+        fallback = mp3_path or caf_path
+        if fallback and os.path.isfile(fallback):
+            await adapter.send_document(chat_id, fallback)
+
+    future = asyncio.run_coroutine_threadsafe(_deliver(), loop)
+    try:
+        future.result(timeout=60)
+    except concurrent.futures.TimeoutError:
+        logger.warning("[calling] BlueBubbles audio delivery timed out")
+    except Exception as exc:
+        logger.error("[calling] BlueBubbles audio delivery error: %s", exc)
 
 def make_phone_call(args: dict, **kwargs) -> str:
     """Execute the outbound phone call."""
