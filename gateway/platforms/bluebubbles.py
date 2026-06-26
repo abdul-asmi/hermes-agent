@@ -560,6 +560,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         filename: Optional[str] = None,
         caption: Optional[str] = None,
         is_audio_message: bool = False,
+        mime_type: Optional[str] = None,
     ) -> SendResult:
         """Send a file attachment via BlueBubbles multipart upload."""
         if not self.client:
@@ -572,9 +573,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Chat not found: {chat_id}")
 
         fname = filename or os.path.basename(file_path)
+        content_type = mime_type or "application/octet-stream"
         try:
             with open(file_path, "rb") as f:
-                files = {"attachment": (fname, f, "application/octet-stream")}
+                files = {"attachment": (fname, f, content_type)}
                 data: Dict[str, str] = {
                     "chatGuid": guid,
                     "name": fname,
@@ -641,8 +643,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
+        mime = "audio/x-caf" if audio_path.endswith(".caf") else None
         return await self._send_attachment(
-            chat_id, audio_path, caption=caption, is_audio_message=True
+            chat_id, audio_path, caption=caption, is_audio_message=True, mime_type=mime
         )
 
     async def send_video(

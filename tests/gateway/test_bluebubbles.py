@@ -830,3 +830,112 @@ class TestBlueBubblesWebhookRegistration:
             adapter._unregister_webhook()
         )
         assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Native voice / audio-message sending
+# ---------------------------------------------------------------------------
+
+
+class TestBlueBubblesNativeVoiceSend:
+    """Verify send_voice uses isAudioMessage=true and audio/x-caf MIME for CAF files."""
+
+    @staticmethod
+    def _make_upload_tracker(monkeypatch, adapter, result_json=None):
+        """Patch _send_attachment at the HTTP layer and capture what was posted."""
+        captured = {}
+        _result = result_json or {"status": 200, "data": {"guid": "msg-audio-1"}}
+
+        async def fake_resolve_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        class MockClient:
+            async def post(self, url, *, files=None, data=None, timeout=None):
+                captured["files"] = files
+                captured["data"] = data
+
+                class R:
+                    status_code = 200
+                    content = b""
+
+                    def raise_for_status(self):
+                        pass
+
+                    def json(self):
+                        return _result
+
+                return R()
+
+        adapter.client = MockClient()
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_guid)
+        return captured
+
+    def test_send_voice_sets_is_audio_message(self, monkeypatch, tmp_path):
+        """send_voice always sets isAudioMessage=true in the multipart payload."""
+        import asyncio
+
+        adapter = _make_adapter(monkeypatch)
+        audio_file = tmp_path / "voice.mp3"
+        audio_file.write_bytes(b"fake-mp3")
+        captured = self._make_upload_tracker(monkeypatch, adapter)
+
+        asyncio.get_event_loop().run_until_complete(
+            adapter.send_voice(str(audio_file), str(audio_file))
+        )
+
+        assert captured["data"]["isAudioMessage"] == "true"
+
+    def test_send_voice_uses_audio_x_caf_mime_for_caf(self, monkeypatch, tmp_path):
+        """CAF files must be uploaded with audio/x-caf MIME so BB renders a native bubble."""
+        import asyncio
+
+        adapter = _make_adapter(monkeypatch)
+        caf_file = tmp_path / "call_abc123.caf"
+        caf_file.write_bytes(b"fake-caf")
+        captured = self._make_upload_tracker(monkeypatch, adapter)
+
+        asyncio.get_event_loop().run_until_complete(
+            adapter.send_voice(str(caf_file), str(caf_file))
+        )
+
+        fname, _fobj, content_type = captured["files"]["attachment"]
+        assert content_type == "audio/x-caf", f"Expected audio/x-caf, got {content_type}"
+        assert fname.endswith(".caf")
+
+    def test_send_voice_non_caf_uses_octet_stream(self, monkeypatch, tmp_path):
+        """Non-CAF audio (MP3, etc.) should use the generic MIME."""
+        import asyncio
+
+        adapter = _make_adapter(monkeypatch)
+        mp3_file = tmp_path / "voice.mp3"
+        mp3_file.write_bytes(b"fake-mp3")
+        captured = self._make_upload_tracker(monkeypatch, adapter)
+
+        asyncio.get_event_loop().run_until_complete(
+            adapter.send_voice(str(mp3_file), str(mp3_file))
+        )
+
+        _fname, _fobj, content_type = captured["files"]["attachment"]
+        assert content_type == "application/octet-stream"
+
+    def test_send_attachment_respects_custom_mime_type(self, monkeypatch, tmp_path):
+        """_send_attachment forwards the caller-supplied mime_type to the upload."""
+        import asyncio
+
+        adapter = _make_adapter(monkeypatch)
+        f = tmp_path / "clip.caf"
+        f.write_bytes(b"data")
+        captured = self._make_upload_tracker(monkeypatch, adapter)
+
+        asyncio.get_event_loop().run_until_complete(
+            adapter._send_attachment(
+                "user@example.com",
+                str(f),
+                is_audio_message=True,
+                mime_type="audio/x-caf",
+            )
+        )
+
+        _fn, _fo, ct = captured["files"]["attachment"]
+        assert ct == "audio/x-caf"
+        assert captured["data"]["isAudioMessage"] == "true"
